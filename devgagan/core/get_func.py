@@ -5,6 +5,7 @@ import re
 import subprocess
 import requests
 import traceback
+import pyrogram  # <-- Added to fix the NameError in type annotations
 from devgagan import app
 from devgagan import sex as gf
 import pymongo
