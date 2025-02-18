@@ -8,13 +8,13 @@ import traceback
 from devgagan import app
 from devgagan import sex as gf
 import pymongo
-from pyrogram import filters
+from pyrogram import filters, Client as PyroClient
 from pyrogram.errors import ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid, PeerIdInvalid
 from pyrogram.enums import MessageMediaType
 from devgagan.core.func import progress_bar, video_metadata, screenshot
 from devgagan.core.mongo import db
 from pyrogram.types import Message
-from config import MONGO_DB as MONGODB_CONNECTION_STRING, LOG_GROUP, SECONDS
+from config import MONGO_DB as MONGODB_CONNECTION_STRING, LOG_GROUP, SECONDS, API_ID, API_HASH
 import cv2
 from telethon import events, Button
 
@@ -386,25 +386,44 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                 except Exception:
                     pass
     else:
-        # ----- MODIFIED PUBLIC GROUP HANDLING -----
+        # ----- MODIFIED PUBLIC GROUP HANDLING (FALLBACK LOGIC) -----
         edit = await app.edit_message_text(sender, edit_id, "Cloning...")
         try:
             parts = msg_link.split("/")
-            # For public links, the username is always at index 3.
             if len(parts) > 3:
-                chat = parts[3]
+                username = parts[3]
             else:
-                chat = msg_link.split("/")[-2]
-            await copy_message_with_chat_id(app, sender, chat, msg_id)
-            try:
-                await edit.delete()
-            except Exception:
-                pass
+                username = msg_link.split("/")[-2]
         except Exception as e:
-            try:
+            await app.edit_message_text(sender, edit_id, f". Error: {e}")
+            return
+        try:
+            msg = await app.get_messages(username, msg_id)
+        except Exception as e:
+            if "UsernameNotOccupied" in str(e):
+                await app.send_message(sender, "The username is not occupied by anyone", reply_to_message_id=message.id)
+                return
+            else:
                 await app.edit_message_text(sender, edit_id, f". Error: {e}")
-            except Exception:
-                pass
+                return
+        try:
+            await app.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+        except Exception as e:
+            # Fallback: use private session to download and upload the media
+            try:
+                user_data = collection.find_one({"user_id": message.chat.id})
+                if not user_data or not user_data.get('session'):
+                    await app.send_message(message.chat.id, "Need login", reply_to_message_id=message.id)
+                    return
+                acc = PyroClient("saverestricted", session_string=user_data['session'], api_id=API_ID, api_hash=API_HASH)
+                await acc.connect()
+                await handle_private(app, acc, message, username, msg_id)
+            except Exception as ex:
+                await app.send_message(message.chat.id, f"Error: {ex}", reply_to_message_id=message.id)
+        try:
+            await edit.delete()
+        except Exception:
+            pass
 
 async def copy_message_with_chat_id(client, sender, chat_id, message_id):
     target_chat_id = user_chat_ids.get(sender, sender)
@@ -446,6 +465,190 @@ async def copy_message_with_chat_id(client, sender, chat_id, message_id):
             await client.send_message(sender, ".")
         except Exception:
             pass
+
+# ----- ADDED HELPER FUNCTIONS FROM SOLUTION CODE -----
+def progress(current, total, message, type):
+    with open(f'{message.id}{type}status.txt', "w") as fileup:
+        fileup.write(f"{current * 100 / total:.1f}%")
+
+async def downstatus(client, statusfile, message):
+    while True:
+        if os.path.exists(statusfile):
+            break
+        await asyncio.sleep(3)
+    while os.path.exists(statusfile):
+        with open(statusfile, "r") as downread:
+            txt = downread.read()
+        try:
+            await client.edit_message_text(message.chat.id, message.id, f"Downloaded : {txt}")
+            await asyncio.sleep(10)
+        except:
+            await asyncio.sleep(5)
+
+async def upstatus(client, statusfile, message):
+    while True:
+        if os.path.exists(statusfile):
+            break
+        await asyncio.sleep(3)
+    while os.path.exists(statusfile):
+        with open(statusfile, "r") as upread:
+            txt = upread.read()
+        try:
+            await client.edit_message_text(message.chat.id, message.id, f"Uploaded : {txt}")
+            await asyncio.sleep(10)
+        except:
+            await asyncio.sleep(5)
+
+async def handle_private(client, acc, message, chatid, msgid):
+    # Fallback method for public messages – download via the alternate account and reupload
+    msg = await acc.get_messages(chatid, msgid)
+    msg_type = get_message_type(msg)
+    chat = message.chat.id
+    if msg_type == "Text":
+        try:
+            await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=message.id)
+        except Exception as e:
+            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+            return
+
+    smsg = await client.send_message(message.chat.id, 'Downloading', reply_to_message_id=message.id)
+    down_status_file = f'{message.id}downstatus.txt'
+    up_status_file = f'{message.id}upstatus.txt'
+    asyncio.create_task(downstatus(client, down_status_file, smsg))
+    try:
+        file = await acc.download_media(msg, progress=progress, progress_args=[message, "down"])
+        if os.path.exists(down_status_file):
+            os.remove(down_status_file)
+    except Exception as e:
+        await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+        return
+    asyncio.create_task(upstatus(client, up_status_file, smsg))
+    caption = msg.caption if msg.caption else None
+            
+    if msg_type == "Document":
+        try:
+            ph_path = None
+            if msg.document.thumbs and len(msg.document.thumbs) > 0:
+                ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
+        except:
+            ph_path = None
+        
+        try:
+            await client.send_document(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, progress=progress, progress_args=[message, "up"])
+        except Exception as e:
+            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+        if ph_path is not None and os.path.exists(ph_path):
+            os.remove(ph_path)
+            
+    elif msg_type == "Video":
+        try:
+            ph_path = None
+            if msg.video.thumbs and len(msg.video.thumbs) > 0:
+                ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
+        except:
+            ph_path = None
+        
+        try:
+            await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, reply_to_message_id=message.id, progress=progress, progress_args=[message, "up"])
+        except Exception as e:
+            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+        if ph_path is not None and os.path.exists(ph_path):
+            os.remove(ph_path)
+
+    elif msg_type == "Animation":
+        try:
+            await client.send_animation(chat, file, reply_to_message_id=message.id)
+        except Exception as e:
+            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+            
+    elif msg_type == "Sticker":
+        try:
+            await client.send_sticker(chat, file, reply_to_message_id=message.id)
+        except Exception as e:
+            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+            
+    elif msg_type == "Voice":
+        try:
+            await client.send_voice(chat, file, caption=caption, reply_to_message_id=message.id, progress=progress, progress_args=[message, "up"])
+        except Exception as e:
+            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+            
+    elif msg_type == "Audio":
+        try:
+            ph_path = None
+            if msg.audio.thumbs and len(msg.audio.thumbs) > 0:
+                ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
+        except:
+            ph_path = None
+
+        try:
+            await client.send_audio(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, progress=progress, progress_args=[message, "up"])   
+        except Exception as e:
+            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+            
+        if ph_path is not None and os.path.exists(ph_path):
+            os.remove(ph_path)
+
+    elif msg_type == "Photo":
+        try:
+            await client.send_photo(chat, file, caption=caption, reply_to_message_id=message.id)
+        except Exception as e:
+            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+    
+    if os.path.exists(up_status_file): 
+        os.remove(up_status_file)
+    if os.path.exists(file):
+        os.remove(file)
+    await client.delete_messages(message.chat.id, [smsg.id])
+
+def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
+    try:
+        msg.document.file_id
+        return "Document"
+    except:
+        pass
+
+    try:
+        msg.video.file_id
+        return "Video"
+    except:
+        pass
+
+    try:
+        msg.animation.file_id
+        return "Animation"
+    except:
+        pass
+
+    try:
+        msg.sticker.file_id
+        return "Sticker"
+    except:
+        pass
+
+    try:
+        msg.voice.file_id
+        return "Voice"
+    except:
+        pass
+
+    try:
+        msg.audio.file_id
+        return "Audio"
+    except:
+        pass
+
+    try:
+        msg.photo.file_id
+        return "Photo"
+    except:
+        pass
+
+    try:
+        msg.text
+        return "Text"
+    except:
+        pass
 
 DB_NAME = "smart_users"
 COLLECTION_NAME = "super_user"
