@@ -5,7 +5,7 @@ import re
 import subprocess
 import requests
 import traceback
-import pyrogram  # <-- Added to fix the NameError in type annotations
+import pyrogram  # Required for type annotations below
 from devgagan import app
 from devgagan import sex as gf
 import pymongo
@@ -408,19 +408,26 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                 await app.edit_message_text(sender, edit_id, f". Error: {e}")
                 return
         try:
+            # First try copying directly
             await app.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
         except Exception as e:
-            # Fallback: use private session to download and upload the media
             try:
-                user_data = collection.find_one({"user_id": message.chat.id})
-                if not user_data or not user_data.get('session'):
-                    await app.send_message(message.chat.id, "Need login", reply_to_message_id=message.id)
-                    return
-                acc = PyroClient("saverestricted", session_string=user_data['session'], api_id=API_ID, api_hash=API_HASH)
-                await acc.connect()
-                await handle_private(app, acc, message, username, msg_id)
-            except Exception as ex:
-                await app.send_message(message.chat.id, f"Error: {ex}", reply_to_message_id=message.id)
+                # Attempt to join the public group if not already a member
+                await app.join_chat(username)
+                await asyncio.sleep(1)
+                await app.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+            except Exception as join_exc:
+                # Fallback: use private session to download and reupload (requires a stored session)
+                try:
+                    user_data = collection.find_one({"user_id": message.chat.id})
+                    if not user_data or not user_data.get('session'):
+                        await app.send_message(message.chat.id, "Need login", reply_to_message_id=message.id)
+                        return
+                    acc = PyroClient("saverestricted", session_string=user_data['session'], api_id=API_ID, api_hash=API_HASH)
+                    await acc.connect()
+                    await handle_private(app, acc, message, username, msg_id)
+                except Exception as ex:
+                    await app.send_message(message.chat.id, f"Error: {ex}", reply_to_message_id=message.id)
         try:
             await edit.delete()
         except Exception:
@@ -467,7 +474,7 @@ async def copy_message_with_chat_id(client, sender, chat_id, message_id):
         except Exception:
             pass
 
-# ----- ADDED HELPER FUNCTIONS FROM SOLUTION CODE -----
+# ----- HELPER FUNCTIONS FROM SOLUTION CODE -----
 def progress(current, total, message, type):
     with open(f'{message.id}{type}status.txt', "w") as fileup:
         fileup.write(f"{current * 100 / total:.1f}%")
@@ -501,7 +508,7 @@ async def upstatus(client, statusfile, message):
             await asyncio.sleep(5)
 
 async def handle_private(client, acc, message, chatid, msgid):
-    # Fallback method for public messages – download via the alternate account and reupload
+    # Fallback method: download the media via a private session and reupload it
     msg = await acc.get_messages(chatid, msgid)
     msg_type = get_message_type(msg)
     chat = message.chat.id
@@ -866,3 +873,4 @@ async def handle_user_input(event):
             save_delete_words(user_id, delete_words)
             await event.respond(f"Words added to delete list: {', '.join(words_to_delete)}")
         del sessions[user_id]
+ 
