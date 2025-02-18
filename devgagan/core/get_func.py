@@ -5,28 +5,28 @@ import re
 import subprocess
 import requests
 import traceback
-import pyrogram  # Required for type annotations below
 from devgagan import app
 from devgagan import sex as gf
 import pymongo
-from pyrogram import filters, Client as PyroClient
+from pyrogram import filters
 from pyrogram.errors import ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid, PeerIdInvalid
 from pyrogram.enums import MessageMediaType
 from devgagan.core.func import progress_bar, video_metadata, screenshot
 from devgagan.core.mongo import db
 from pyrogram.types import Message
-from config import MONGO_DB as MONGODB_CONNECTION_STRING, LOG_GROUP, SECONDS, API_ID, API_HASH
+from config import MONGO_DB as MONGODB_CONNECTION_STRING, LOG_GROUP, SECONDS
 import cv2
 from telethon import events, Button
 
 def thumbnail(sender):
     return f'{sender}.jpg' if os.path.exists(f'{sender}.jpg') else None
 
-MAX_CHUNK_SIZE = 2000 * 1024**2
+MAX_CHUNK_SIZE = 2000 * 1024**2  # ~2GB
+
 def split_file(file_path, chunk_size=MAX_CHUNK_SIZE):
     chunk_files = []
     chunk_number = 1
-    buffer_size = 64 * 1024
+    buffer_size = 64 * 1024  # 64KB
     with open(file_path, "rb") as f:
         while True:
             bytes_written = 0
@@ -58,6 +58,7 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
     if "?single" in msg_link:
         msg_link = msg_link.split("?single")[0]
     msg_id = int(msg_link.split("/")[-1]) + int(i)
+    # If link contains protected channel markers, process as before.
     if 't.me/c/' in msg_link or 't.me/b/' in msg_link:
         parts = msg_link.split("/")
         if 't.me/b/' not in msg_link:
@@ -74,16 +75,14 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
             if msg.empty is not None:
                 return None
             if msg.media:
-                snt_msgs = []
                 if msg.media == MessageMediaType.WEB_PAGE:
                     target_chat_id = user_chat_ids.get(chatx, chatx)
                     edit = await app.edit_message_text(target_chat_id, edit_id, "Cloning...")
                     m = await app.send_message(sender, msg.text.markdown)
-                    snt_msgs.append(m)
                     if msg.pinned_message:
                         try:
                             await m.pin(both_sides=True)
-                        except Exception:
+                        except Exception as e:
                             await m.pin()
                     await m.copy(LOG_GROUP)
                     try:
@@ -92,23 +91,16 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                         pass
                     await message.reply_text("Content will be deleted in 5 minutes.\nForward to saved messages", parse_mode="markdown")
                     await asyncio.sleep(SECONDS)
-                    for m in snt_msgs:
-                        try:
-                            await m.delete()
-                        except Exception:
-                            pass
                     return
             if not msg.media:
-                snt_msgs = []
                 if msg.text:
                     target_chat_id = user_chat_ids.get(chatx, chatx)
                     edit = await app.edit_message_text(target_chat_id, edit_id, "Cloning...")
-                    m = await app.send_message(sender, msg.text.markdown)
-                    snt_msgs.append(m)
+                    m = await app.send_message(target_chat_id, msg.text.markdown)
                     if msg.pinned_message:
                         try:
                             await m.pin(both_sides=True)
-                        except Exception:
+                        except Exception as e:
                             await m.pin()
                     await m.copy(LOG_GROUP)
                     try:
@@ -117,12 +109,19 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                         pass
                     await message.reply_text("Content will be deleted in 5 minutes.\nForward to saved messages", parse_mode="markdown")
                     await asyncio.sleep(SECONDS)
-                    for m in snt_msgs:
-                        try:
-                            await m.delete()
-                        except Exception:
-                            pass
                     return
+            if msg.sticker:
+                edit = await app.edit_message_text(sender, edit_id, "Sticker detected...")
+                result = await app.send_sticker(target_chat_id, msg.sticker.file_id)
+                await result.copy(LOG_GROUP)
+                await edit.delete(2)
+                return
+            file_size = None
+            if msg.document or msg.photo or msg.video:
+                file_size = msg.document.file_size if msg.document else (msg.photo.file_size if msg.photo else msg.video.file_size)
+            if file_size and file_size > 2 * 1024 * 1024 * 1024:
+                await edit.edit("**__❌ File size is greater than 2 GB, purchase premium to proceed or use /token to get 3 hour access for free__")
+                return
             edit = await app.edit_message_text(sender, edit_id, "Trying to Download...")
             file = await userbot.download_media(
                 msg,
@@ -172,7 +171,11 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                 delete_words = load_delete_words(sender)
                 custom_caption = get_user_caption_preference(sender)
                 original_caption = msg.caption if msg.caption else ''
-                final_caption = f"{original_caption}\n\n__**{custom_caption}**__" if custom_caption else f"{original_caption}"
+                final_caption = f"{original_caption}"
+                replacements = load_replacement_words(chatx)
+                for word, replace_word in replacements.items():
+                    final_caption = final_caption.replace(word, replace_word)
+                caption = f"{final_caption}\n\n__**{custom_caption}**__" if custom_caption else f"{final_caption}"
                 upload_failed = False
                 for i, chunk in enumerate(chunk_files):
                     try:
@@ -206,6 +209,7 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                             os.remove(chunk)
                 if os.path.exists(file):
                     os.remove(file)
+                file = None
                 if not upload_failed:
                     asyncio.create_task(delete_after(status_msg1))
                     asyncio.create_task(delete_after(status_msg2))
@@ -264,34 +268,26 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                 caption = f"{final_caption}\n\n__**{custom_caption}**__" if custom_caption else f"{final_caption}"
                 target_chat_id = user_chat_ids.get(chatx, chatx)
                 thumb_path = await screenshot(file, duration, chatx)
+                upload_method = await fetch_upload_method(sender)
                 try:
-                    devgaganin = await app.send_video(
-                        chat_id=target_chat_id,
-                        video=file,
-                        caption=caption,
-                        supports_streaming=True,
-                        height=height,
-                        width=width,
-                        duration=duration,
-                        thumb=thumb_path,
-                        progress=progress_bar,
-                        progress_args=('**__Uploading...__**', edit, time.time())
-                    )
-                    if msg.pinned_message:
-                        try:
-                            await devgaganin.pin(both_sides=True)
-                        except Exception:
-                            await devgaganin.pin()
-                    try:
+                    if upload_method == "Pyrogram":
+                        devgaganin = await app.send_video(chat_id=target_chat_id, video=file, caption=caption, supports_streaming=True, height=height, width=width, thumb=thumb_path, duration=duration, progress=progress_bar, progress_args=('**__Uploading...__**', edit, time.time()))
                         await devgaganin.copy(LOG_GROUP)
-                    except Exception as e:
-                        print(f"Error copying video to LOG_GROUP: {e}")
+                    elif upload_method == "Telethon":
+                        await edit.delete()
+                        progress_message = await gf.send_message(sender, "__**Uploading ...**__")
+                        uploaded = await fast_upload(gf, file, reply=progress_message, name=None, progress_bar_function=lambda done, total: progress_callback(done, total, sender))
+                        await gf.send_file(target_chat_id, uploaded, caption=caption, attributes=[DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)], thumb=thumb_path)
+                        await gf.send_file(LOG_GROUP, uploaded, caption=caption, attributes=[DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)], thumb=thumb_path)
+                        await progress_message.delete()
+                    if os.path.exists(file):
+                        os.remove(file)
+                    file = None
                 except Exception:
                     try:
-                        await app.edit_message_text(sender, edit_id, ".")
+                        await app.edit_message_text(sender, edit_id, "The bot is not an admin in the specified chat...")
                     except Exception:
-                        pass
-                os.remove(file)
+                        await progress_message.edit("Something Greate happened my jaan")
             elif msg.media == MessageMediaType.PHOTO:
                 await app.edit_message_text(sender, edit_id, "**Uploading photo...**")
                 delete_words = load_delete_words(sender)
@@ -307,14 +303,13 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                 if msg.pinned_message:
                     try:
                         await devgaganin.pin(both_sides=True)
-                    except Exception:
+                    except Exception as e:
                         await devgaganin.pin()
                 try:
                     await devgaganin.copy(LOG_GROUP)
                 except Exception as e:
                     print(f"Error copying photo to LOG_GROUP: {e}")
             else:
-                thumb_path = thumbnail(chatx)
                 delete_words = load_delete_words(sender)
                 custom_caption = get_user_caption_preference(sender)
                 original_caption = msg.caption if msg.caption else ''
@@ -323,52 +318,40 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                 for word, replace_word in replacements.items():
                     final_caption = final_caption.replace(word, replace_word)
                 caption = f"{final_caption}\n\n__**{custom_caption}**__" if custom_caption else f"{final_caption}"
+                file_extension = file_extension.lower()
+                video_extensions = {'mkv', 'mp4', 'webm', 'mpe4', 'mpeg', 'ts', 'avi', 'flv', 'mov', 'm4v', '3gp', '3g2', 'wmv', 'vob', 'ogv', 'ogx', 'qt', 'f4v', 'f4p', 'f4a', 'f4b', 'dat', 'rm', 'rmvb', 'asf', 'amv', 'divx'}
                 target_chat_id = user_chat_ids.get(chatx, chatx)
+                upload_method = await fetch_upload_method(sender)
                 try:
-                    if msg.media == MessageMediaType.DOCUMENT:
-                        devgaganin = await app.send_document(
-                            chat_id=target_chat_id,
-                            document=file,
-                            caption=caption,
-                            thumb=thumb_path,
-                            progress=progress_bar,
-                            progress_args=('**Uploading...**', edit, time.time())
-                        )
-                    elif msg.media == MessageMediaType.AUDIO:
-                        devgaganin = await app.send_audio(
-                            chat_id=target_chat_id,
-                            audio=file,
-                            caption=caption,
-                            progress=progress_bar,
-                            progress_args=('**Uploading...**', edit, time.time())
-                        )
-                    elif msg.media == MessageMediaType.VOICE:
-                        devgaganin = await app.send_voice(
-                            chat_id=target_chat_id,
-                            voice=file,
-                            caption=caption,
-                            progress=progress_bar,
-                            progress_args=('**Uploading...**', edit, time.time())
-                        )
+                    if file_extension in video_extensions:
+                        if upload_method == "Pyrogram":
+                            devgaganin = await app.send_video(chat_id=target_chat_id, video=file, caption=caption, supports_streaming=True, height=height, width=width, duration=duration, thumb=thumb_path, progress=progress_bar, progress_args=("**__Uploading...__**", edit, time.time()))
+                            await devgaganin.copy(LOG_GROUP)
+                        elif upload_method == "Telethon":
+                            await edit.delete()
+                            progress_message = await gf.send_message(sender, "**__Starting Upload__**")
+                            uploaded = await fast_upload(gf, file, reply=progress_message, name=None, progress_bar_function=lambda done, total: progress_callback(done, total, sender))
+                            await gf.send_file(target_chat_id, uploaded, caption=caption, attributes=[DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)], thumb=thumb_path)
+                            await gf.send_file(LOG_GROUP, uploaded, caption=caption, attributes=[DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)], thumb=thumb_path)
                     else:
-                        devgaganin = await app.send_document(
-                            chat_id=target_chat_id,
-                            document=file,
-                            caption=caption,
-                            thumb=thumb_path,
-                            progress=progress_bar,
-                            progress_args=('**Uploading...**', edit, time.time())
-                        )
+                        if upload_method == "Pyrogram":
+                            devgaganin = await app.send_document(chat_id=target_chat_id, document=file, caption=caption, thumb=thumb_path, progress=progress_bar, progress_args=("**__Uploading...__**", edit, time.time()))
+                            await devgaganin.copy(LOG_GROUP)
+                        elif upload_method == "Telethon":
+                            await edit.delete()
+                            progress_message = await gf.send_message(sender, "Uploading ...")
+                            uploaded = await fast_upload(gf, file, reply=progress_message, name=None, progress_bar_function=lambda done, total: progress_callback(done, total, sender))
+                            await gf.send_file(target_chat_id, uploaded, caption=caption, thumb=thumb_path)
+                            await gf.send_file(LOG_GROUP, uploaded, caption=caption, thumb=thumb_path)
+                    if os.path.exists(file):
+                        os.remove(file)
+                    file = None
                 except Exception:
                     try:
-                        await app.edit_message_text(sender, edit_id, ".")
+                        await app.edit_message_text(sender, edit_id, "The bot is not an admin in the specified chat.")
                     except Exception:
-                        pass
-                os.remove(file)
-            try:
-                await edit.delete()
-            except Exception:
-                pass
+                        await progress_message.edit("Something Greate happened my jaan")
+            await edit.delete()
         except (ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid):
             try:
                 await app.edit_message_text(sender, edit_id, "Have you joined the channel?")
@@ -387,44 +370,32 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                 except Exception:
                     pass
     else:
-        # ----- MODIFIED PUBLIC GROUP HANDLING (FALLBACK LOGIC) -----
-        edit = await app.edit_message_text(sender, edit_id, "Cloning...")
-        try:
-            parts = msg_link.split("/")
-            if len(parts) > 3:
-                username = parts[3]
-            else:
-                username = msg_link.split("/")[-2]
-        except Exception as e:
-            await app.edit_message_text(sender, edit_id, f". Error: {e}")
-            return
-        try:
-            msg = await app.get_messages(username, msg_id)
-        except Exception as e:
-            if "UsernameNotOccupied" in str(e):
-                await app.send_message(sender, "The username is not occupied by anyone", reply_to_message_id=message.id)
-                return
-            else:
-                await app.edit_message_text(sender, edit_id, f". Error: {e}")
-                return
-        try:
-            # First try copying directly
-            await app.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-        except Exception as e:
+        # NEW branch to handle public group/channel links.
+        datas = msg_link.split("/")
+        # If the URL has at least 4 parts and does NOT contain 'c' or 'b'
+        if len(datas) >= 4 and not any(x in datas for x in ['c', 'b']):
             try:
-                # Attempt to join the public group if not already a member (ignore errors if already joined)
+                username = datas[3]
+                # For links like https://t.me/unlocked_india/2/57, we consider the last segment as msg_id.
+                pub_msg = await app.get_messages(username, msg_id)
+                if pub_msg:
+                    await app.copy_message(sender, pub_msg.chat.id, pub_msg.id)
+                else:
+                    # Fallback if get_messages returns None
+                    await copy_message_with_chat_id(app, sender, username, msg_id)
+            except Exception as e:
                 try:
-                    await app.join_chat(username)
-                except Exception:
-                    pass
-                await asyncio.sleep(1)
-                await app.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-            except Exception as join_exc:
-                await app.send_message(message.chat.id, f"Error: {join_exc}", reply_to_message_id=message.id)
-        try:
-            await edit.delete()
-        except Exception:
-            pass
+                    await copy_message_with_chat_id(app, sender, username, msg_id)
+                except Exception as ex:
+                    await app.send_message(sender, f"Error: {str(ex)}")
+        else:
+            edit = await app.edit_message_text(sender, edit_id, "Cloning...")
+            try:
+                chat = msg_link.split("/")[-2]
+                await copy_message_with_chat_id(app, sender, chat, msg_id)
+                await edit.delete()
+            except Exception as e:
+                await app.edit_message_text(sender, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
 
 async def copy_message_with_chat_id(client, sender, chat_id, message_id):
     target_chat_id = user_chat_ids.get(sender, sender)
@@ -458,225 +429,15 @@ async def copy_message_with_chat_id(client, sender, chat_id, message_id):
         if msg.pinned_message:
             try:
                 await result.pin(both_sides=True)
-            except Exception:
+            except Exception as e:
                 await result.pin()
     except Exception as e:
-        try:
-            await client.send_message(sender, f". Error in copy_message: {e}")
-            await client.send_message(sender, ".")
-        except Exception:
-            pass
+        error_message = f"Error occurred while sending message to chat ID {target_chat_id}: {str(e)}"
+        await client.send_message(sender, error_message)
+        await client.send_message(sender, f"Make Bot admin in your Channel - {target_chat_id} and restart the process after /cancel")
 
-# ----- HELPER FUNCTIONS FROM SOLUTION CODE -----
-def progress(current, total, message, type):
-    with open(f'{message.id}{type}status.txt', "w") as fileup:
-        fileup.write(f"{current * 100 / total:.1f}%")
-
-async def downstatus(client, statusfile, message):
-    while True:
-        if os.path.exists(statusfile):
-            break
-        await asyncio.sleep(3)
-    while os.path.exists(statusfile):
-        with open(statusfile, "r") as downread:
-            txt = downread.read()
-        try:
-            await client.edit_message_text(message.chat.id, message.id, f"Downloaded : {txt}")
-            await asyncio.sleep(10)
-        except:
-            await asyncio.sleep(5)
-
-async def upstatus(client, statusfile, message):
-    while True:
-        if os.path.exists(statusfile):
-            break
-        await asyncio.sleep(3)
-    while os.path.exists(statusfile):
-        with open(statusfile, "r") as upread:
-            txt = upread.read()
-        try:
-            await client.edit_message_text(message.chat.id, message.id, f"Uploaded : {txt}")
-            await asyncio.sleep(10)
-        except:
-            await asyncio.sleep(5)
-
-async def handle_private(client, acc, message, chatid, msgid):
-    # Fallback method: download the media via a private session and reupload it
-    msg = await acc.get_messages(chatid, msgid)
-    msg_type = get_message_type(msg)
-    chat = message.chat.id
-    if msg_type == "Text":
-        try:
-            await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=message.id)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-            return
-
-    smsg = await client.send_message(message.chat.id, 'Downloading', reply_to_message_id=message.id)
-    down_status_file = f'{message.id}downstatus.txt'
-    up_status_file = f'{message.id}upstatus.txt'
-    asyncio.create_task(downstatus(client, down_status_file, smsg))
-    try:
-        file = await acc.download_media(msg, progress=progress, progress_args=[message, "down"])
-        if os.path.exists(down_status_file):
-            os.remove(down_status_file)
-    except Exception as e:
-        await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-        return
-    asyncio.create_task(upstatus(client, up_status_file, smsg))
-    caption = msg.caption if msg.caption else None
-            
-    if msg_type == "Document":
-        try:
-            ph_path = None
-            if msg.document.thumbs and len(msg.document.thumbs) > 0:
-                ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
-        except:
-            ph_path = None
-        
-        try:
-            await client.send_document(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, progress=progress, progress_args=[message, "up"])
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-        if ph_path is not None and os.path.exists(ph_path):
-            os.remove(ph_path)
-            
-    elif msg_type == "Video":
-        try:
-            ph_path = None
-            if msg.video.thumbs and len(msg.video.thumbs) > 0:
-                ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
-        except:
-            ph_path = None
-        
-        try:
-            await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, reply_to_message_id=message.id, progress=progress, progress_args=[message, "up"])
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-        if ph_path is not None and os.path.exists(ph_path):
-            os.remove(ph_path)
-
-    elif msg_type == "Animation":
-        try:
-            await client.send_animation(chat, file, reply_to_message_id=message.id)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-            
-    elif msg_type == "Sticker":
-        try:
-            await client.send_sticker(chat, file, reply_to_message_id=message.id)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-            
-    elif msg_type == "Voice":
-        try:
-            await client.send_voice(chat, file, caption=caption, reply_to_message_id=message.id, progress=progress, progress_args=[message, "up"])
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-            
-    elif msg_type == "Audio":
-        try:
-            ph_path = None
-            if msg.audio.thumbs and len(msg.audio.thumbs) > 0:
-                ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
-        except:
-            ph_path = None
-
-        try:
-            await client.send_audio(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, progress=progress, progress_args=[message, "up"])   
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-            
-        if ph_path is not None and os.path.exists(ph_path):
-            os.remove(ph_path)
-
-    elif msg_type == "Photo":
-        try:
-            await client.send_photo(chat, file, caption=caption, reply_to_message_id=message.id)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-    
-    if os.path.exists(up_status_file): 
-        os.remove(up_status_file)
-    if os.path.exists(file):
-        os.remove(file)
-    await client.delete_messages(message.chat.id, [smsg.id])
-
-def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
-    try:
-        msg.document.file_id
-        return "Document"
-    except:
-        pass
-
-    try:
-        msg.video.file_id
-        return "Video"
-    except:
-        pass
-
-    try:
-        msg.animation.file_id
-        return "Animation"
-    except:
-        pass
-
-    try:
-        msg.sticker.file_id
-        return "Sticker"
-    except:
-        pass
-
-    try:
-        msg.voice.file_id
-        return "Voice"
-    except:
-        pass
-
-    try:
-        msg.audio.file_id
-        return "Audio"
-    except:
-        pass
-
-    try:
-        msg.photo.file_id
-        return "Photo"
-    except:
-        pass
-
-    try:
-        msg.text
-        return "Text"
-    except:
-        pass
-
-DB_NAME = "smart_users"
-COLLECTION_NAME = "super_user"
-mongo_client = pymongo.MongoClient(MONGODB_CONNECTION_STRING)
-db = mongo_client[DB_NAME]
-collection = db[COLLECTION_NAME]
-
-def load_authorized_users():
-    authorized_users = set()
-    for user_doc in collection.find():
-        if "user_id" in user_doc:
-            authorized_users.add(user_doc["user_id"])
-    return authorized_users
-
-def save_authorized_users(authorized_users):
-    collection.delete_many({})
-    for user_id in authorized_users:
-        collection.insert_one({"user_id": user_id})
-
-SUPER_USERS = load_authorized_users()
+user_states = {}
 user_chat_ids = {}
-
-MDB_NAME = "logins"
-MCOLLECTION_NAME = "stringsession"
-m_client = pymongo.MongoClient(MONGODB_CONNECTION_STRING)
-mdb = m_client[MDB_NAME]
-mcollection = mdb[MCOLLECTION_NAME]
 
 def load_delete_words(user_id):
     try:
@@ -691,11 +452,7 @@ def load_delete_words(user_id):
 
 def save_delete_words(user_id, delete_words):
     try:
-        collection.update_one(
-            {"_id": user_id},
-            {"$set": {"delete_words": list(delete_words)}},
-            upsert=True
-        )
+        collection.update_one({"_id": user_id}, {"$set": {"delete_words": list(delete_words)}}, upsert=True)
     except Exception as e:
         print(f"Error saving delete words: {e}")
 
@@ -712,11 +469,7 @@ def load_replacement_words(user_id):
 
 def save_replacement_words(user_id, replacements):
     try:
-        collection.update_one(
-            {"_id": user_id},
-            {"$set": {"replacement_words": replacements}},
-            upsert=True
-        )
+        collection.update_one({"_id": user_id}, {"$set": {"replacement_words": replacements}}, upsert=True)
     except Exception as e:
         print(f"Error saving replacement words: {e}")
 
@@ -866,3 +619,73 @@ async def handle_user_input(event):
             save_delete_words(user_id, delete_words)
             await event.respond(f"Words added to delete list: {', '.join(words_to_delete)}")
         del sessions[user_id]
+
+def load_saved_channel_ids():
+    saved_channel_ids = set()
+    try:
+        for channel_doc in collection.find({"channel_id": {"$exists": True}}):
+            saved_channel_ids.add(channel_doc["channel_id"])
+    except Exception as e:
+        print(f"Error loading saved channel IDs: {e}")
+    return saved_channel_ids
+
+@gf.on(events.NewMessage(incoming=True, pattern='/lock'))
+async def lock_command_handler(event):
+    if event.sender_id not in OWNER_ID:
+        return await event.respond("You are not authorized to use this command.")
+    try:
+        channel_id = int(event.text.split(' ')[1])
+    except (ValueError, IndexError):
+        return await event.respond("Invalid /lock command. Use /lock CHANNEL_ID.")
+    try:
+        collection.insert_one({"channel_id": channel_id})
+        await event.respond(f"Channel ID {channel_id} locked successfully.")
+    except Exception as e:
+        await event.respond(f"Error occurred while locking channel ID: {str(e)}")
+
+user_progress = {}
+
+def progress_callback(done, total, user_id):
+    if user_id not in user_progress:
+        user_progress[user_id] = {'previous_done': 0, 'previous_time': time.time()}
+    user_data = user_progress[user_id]
+    percent = (done / total) * 100
+    completed_blocks = int(percent // 10)
+    fractional_block = int((percent % 10) // 1)
+    remaining_blocks = 10 - completed_blocks - (1 if fractional_block > 0 else 0)
+    progress_bar_str = "✅" * completed_blocks
+    if fractional_block > 0:
+        progress_bar_str += "🟨"
+    progress_bar_str += "🟥" * remaining_blocks
+    done_mb = done / (1024 * 1024)
+    total_mb = total / (1024 * 1024)
+    speed = done - user_data['previous_done']
+    elapsed_time = time.time() - user_data['previous_time']
+    if elapsed_time > 0:
+        speed_bps = speed / elapsed_time
+        speed_mbps = (speed_bps * 8) / (1024 * 1024)
+    else:
+        speed_mbps = 0
+    if speed_bps > 0:
+        remaining_time = (total - done) / speed_bps
+    else:
+        remaining_time = 0
+    remaining_time_min = remaining_time / 60
+    final = (f"╭──────────────────╮\n"
+             f"│     **__SpyLib ⚡ Uploader__**       \n"
+             f"├──────────\n"
+             f"│ {progress_bar_str}\n\n"
+             f"│ **__Progress:__** {percent:.2f}%\n"
+             f"│ **__Done:__** {done_mb:.2f} MB / {total_mb:.2f} MB\n"
+             f"│ **__Speed:__** {speed_mbps:.2f} Mbps\n"
+             f"│ **__ETA:__** {remaining_time_min:.2f} min\n"
+             f"╰──────────────────╯\n\n"
+             f"**__Powered by Team SPY__**")
+    user_data['previous_done'] = done
+    user_data['previous_time'] = time.time()
+    return final
+
+async def add_pdf_watermark(input_pdf, output_pdf_path, watermark_text):
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, add_pdf_watermark_sync, input_pdf, output_pdf_path, watermark_text)
+    return result
